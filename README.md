@@ -116,6 +116,22 @@ The bash script reads env-var overrides (`CTID`, `STORAGE`, `IP_CONFIG`,
 `GATEWAY`, `SUBNET_ROUTES`, `ADVERTISE_EXIT_NODE`, `TS_AUTHKEY`, …) — see the
 `CONFIG` block at the top of the script. Ansible reads `ansible/group_vars/all.yml`.
 
+Leave `CTID` unset and the script auto-picks the **next free container ID**
+(≥ 100, via `pvesh get /cluster/nextid`); the interactive screen shows the
+picked ID as its default.
+
+### Resource sizing (defaults + why)
+
+A Tailscale exit-node / subnet-router is a **light** workload — userspace
+WireGuard, no GUI or database. The defaults suit a typical home uplink:
+
+| Setting | Default | When to raise it |
+|---------|---------|------------------|
+| **Cores** | 1 | 2 only for >~500 Mbps throughput or a busy exit node serving many clients. One core saturates most home uplinks. |
+| **Memory** | 512 MB | 256 MB is the floor; `tailscaled` idles ~50–100 MB, 512 leaves headroom for apt + bursts. |
+| **Swap** | 512 MB | A small OOM-killer safety net; matching RAM is plenty. Not performance-critical. |
+| **Disk** | 4 GB | Debian + Tailscale is ~2 GB; 4 GB leaves room for logs and upgrades. |
+
 > **Secrets:** never commit a real `TS_AUTHKEY` or Proxmox API token. The
 > `.gitignore` excludes common secret files; use `ansible-vault` for the
 > Ansible path.
