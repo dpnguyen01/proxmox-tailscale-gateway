@@ -62,7 +62,8 @@ for _v in CTID HOSTNAME_CT STORAGE TEMPLATE_STORAGE DISK_GB CORES MEMORY_MB \
 done
 
 # --- Container identity / resources ---
-CTID="${CTID:-150}"                       # Proxmox container ID
+# Empty => auto-pick the next free Proxmox container ID (>= 100).
+CTID="${CTID:-}"                          # Proxmox container ID (blank = next free)
 HOSTNAME="${HOSTNAME_CT:-tailscale-gw}"   # container hostname
 STORAGE="${STORAGE:-local-lvm}"           # storage for the rootfs
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}" # storage holding CT templates
@@ -104,10 +105,38 @@ require_host() {
     command -v pct >/dev/null || die "'pct' not found -- this must run on a Proxmox VE host."
 }
 
+# Lowest free container ID >= 100. Prefer Proxmox's own allocator; fall back to
+# scanning `pct list` if pvesh is unavailable.
+next_free_ctid() {
+    local id=""
+    if command -v pvesh >/dev/null; then
+        id="$(pvesh get /cluster/nextid 2>/dev/null)" || id=""
+    fi
+    if [[ -z "$id" ]]; then
+        local used last=99 n
+        used="$(pct list 2>/dev/null | awk 'NR>1{print $1}' | sort -n)"
+        for n in $used; do [[ "$n" -ge 100 ]] && last="$n"; done
+        id=$(( last + 1 ))
+        # Handle gaps: make sure the chosen ID is really free.
+        while pct status "$id" >/dev/null 2>&1; do id=$(( id + 1 )); done
+    fi
+    echo "$id"
+}
+
+# Resolve CTID to the next free ID when the caller left it blank.
+resolve_ctid() {
+    if [[ -z "$CTID" ]]; then
+        CTID="$(next_free_ctid)"
+        [[ -n "$CTID" ]] || die "Could not determine a free container ID."
+        log "No CTID given; using next free container ID: $CTID"
+    fi
+}
+
 ct_exists()  { pct status "$CTID" >/dev/null 2>&1; }
 ct_running() { pct status "$CTID" 2>/dev/null | grep -q running; }
 
 require_ct() {
+    [[ -n "$CTID" ]] || die "No CTID set. '$MODE' needs an existing container ID, e.g. CTID=150 ... $MODE"
     ct_exists || die "Container $CTID does not exist. Run 'install' first."
 }
 
@@ -169,14 +198,35 @@ interactive_setup() {
     echo "======================================================================"
     echo " Tailscale LXC setup  --  press Enter to keep the [default] shown"
     echo "======================================================================"
+    echo " A Tailscale exit-node / subnet-router is a LIGHT workload (userspace"
+    echo " WireGuard, no GUI/DB). The defaults below suit a typical home uplink;"
+    echo " each prompt notes when to go higher."
+    echo
 
-    _prompt CTID         "Container ID (CTID)"
-    _prompt HOSTNAME     "Container hostname"            HOSTNAME_CT
-    _prompt STORAGE      "Rootfs storage"
-    _prompt DISK_GB      "Disk size (GB)"
-    _prompt CORES        "CPU cores"
-    _prompt MEMORY_MB    "Memory (MB)"
-    _prompt BRIDGE       "Network bridge"
+    # CTID: blank default means "auto-pick the next free ID" -- show that.
+    if [[ -z "${_PROVIDED[CTID]:-}" ]]; then
+        local _suggested_ctid; _suggested_ctid="$(next_free_ctid 2>/dev/null || true)"
+        printf 'Container ID (CTID) -- blank = next free [%s]: ' "${_suggested_ctid:-auto}"
+        local _ctid_ans; read -r _ctid_ans
+        [[ -n "$_ctid_ans" ]] && CTID="$_ctid_ans"
+    fi
+
+    _prompt HOSTNAME  "Container hostname" HOSTNAME_CT
+    _prompt STORAGE   "Rootfs storage"
+
+    echo "  (disk: ~2GB used by Debian+Tailscale; 4GB leaves room for logs/upgrades)"
+    _prompt DISK_GB   "Disk size (GB)"
+
+    echo "  (cores: 1 saturates a typical home uplink; use 2 only for >~500Mbps or a busy exit node)"
+    _prompt CORES     "CPU cores"
+
+    echo "  (memory: tailscaled idles ~50-100MB; 512 is comfortable, 256 is the floor)"
+    _prompt MEMORY_MB "Memory (MB)"
+
+    echo "  (swap: a small safety net vs the OOM killer; matching RAM at 512 is plenty)"
+    _prompt SWAP_MB   "Swap (MB)"
+
+    _prompt BRIDGE    "Network bridge"
 
     # Networking: dhcp or static
     if [[ -z "${_PROVIDED[IP_CONFIG]:-}" ]]; then
@@ -194,16 +244,18 @@ interactive_setup() {
         esac
     fi
 
+    echo "  (tip: a gateway you depend on is best on a static IP or DHCP reservation)"
     _prompt SUBNET_ROUTES "Subnet routes to advertise (comma-separated)"
     _prompt_yesno ADVERTISE_EXIT_NODE "Advertise as an exit node?"
     _prompt TS_AUTHKEY   "Tailscale auth key (blank = interactive login later)" TS_AUTHKEY 1
 
     echo
     echo "---------------------------- summary ---------------------------------"
-    printf '  CTID            : %s\n' "$CTID"
+    printf '  CTID            : %s\n' "${CTID:-<next free, auto>}"
     printf '  Hostname        : %s\n' "$HOSTNAME"
     printf '  Storage / disk  : %s / %sGB\n' "$STORAGE" "$DISK_GB"
     printf '  Cores / memory  : %s / %sMB\n' "$CORES" "$MEMORY_MB"
+    printf '  Swap            : %sMB\n' "$SWAP_MB"
     printf '  Bridge / network: %s / %s%s\n' "$BRIDGE" "$IP_CONFIG" \
         "$( [[ "$IP_CONFIG" != dhcp && -n "$GATEWAY" ]] && echo " gw $GATEWAY" )"
     printf '  Subnet routes   : %s\n' "$SUBNET_ROUTES"
@@ -394,6 +446,7 @@ require_host
 case "$MODE" in
     install)
         interactive_setup
+        resolve_ctid
         resolve_template
         create_ct
         ensure_tun
