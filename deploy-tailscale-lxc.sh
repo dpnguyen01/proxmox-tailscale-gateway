@@ -49,6 +49,18 @@ set -euo pipefail
 # --- Mode ---
 MODE="${1:-${MODE:-install}}"
 
+# --- Interactive setup detection ---
+# Record which settings the caller already provided via env var, BEFORE we
+# apply defaults below. On 'install', any setting NOT provided is prompted for
+# in an interactive setup screen (unless NONINTERACTIVE=1 or there is no TTY).
+NONINTERACTIVE="${NONINTERACTIVE:-0}"
+declare -A _PROVIDED=()
+for _v in CTID HOSTNAME_CT STORAGE TEMPLATE_STORAGE DISK_GB CORES MEMORY_MB \
+          SWAP_MB BRIDGE IP_CONFIG GATEWAY UNPRIVILEGED TS_AUTHKEY \
+          SUBNET_ROUTES ADVERTISE_EXIT_NODE TS_EXTRA_ARGS TEMPLATE_NAME; do
+    [[ -n "${!_v+set}" ]] && _PROVIDED[$_v]=1
+done
+
 # --- Container identity / resources ---
 CTID="${CTID:-150}"                       # Proxmox container ID
 HOSTNAME="${HOSTNAME_CT:-tailscale-gw}"   # container hostname
@@ -109,6 +121,101 @@ build_up_args() {
     [[ "$ADVERTISE_EXIT_NODE" == "1" ]] && UP_ARGS+=(--advertise-exit-node)
     # shellcheck disable=SC2206
     [[ -n "$TS_EXTRA_ARGS" ]] && UP_ARGS+=($TS_EXTRA_ARGS)
+}
+
+# ---------------------------------------------------------------------------
+# Interactive setup screen (install mode only)
+# ---------------------------------------------------------------------------
+
+# prompt VARNAME "Question" [provided-flag-key] [secret]
+# Only prompts when the setting was NOT provided via env var. Shows the current
+# default in brackets; empty answer keeps it. `secret=1` hides input.
+_prompt() {
+    local var="$1" question="$2" provided_key="${3:-$1}" secret="${4:-0}"
+    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return   # caller already set it
+    local current="${!var}" answer
+    if [[ "$secret" == "1" ]]; then
+        printf '%s [%s]: ' "$question" "${current:+(set)}"
+        read -r -s answer; echo
+    else
+        printf '%s [%s]: ' "$question" "$current"
+        read -r answer
+    fi
+    [[ -n "$answer" ]] && printf -v "$var" '%s' "$answer"
+}
+
+_prompt_yesno() {
+    local var="$1" question="$2" provided_key="${3:-$1}"
+    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return
+    local def="no"; [[ "${!var}" == "1" ]] && def="yes"
+    local answer
+    printf '%s (yes/no) [%s]: ' "$question" "$def"
+    read -r answer
+    case "${answer,,}" in
+        y|yes) printf -v "$var" '1' ;;
+        n|no)  printf -v "$var" '0' ;;
+        "")    : ;;   # keep default
+        *)     warn "Unrecognized '$answer'; keeping $def." ;;
+    esac
+}
+
+interactive_setup() {
+    # Skip when explicitly non-interactive or not attached to a terminal
+    # (e.g. piped via `bash -c "$(curl ...)"` without a TTY).
+    [[ "$NONINTERACTIVE" == "1" ]] && return
+    [[ -t 0 ]] || { warn "No TTY -- skipping interactive setup, using env/defaults."; return; }
+
+    echo
+    echo "======================================================================"
+    echo " Tailscale LXC setup  --  press Enter to keep the [default] shown"
+    echo "======================================================================"
+
+    _prompt CTID         "Container ID (CTID)"
+    _prompt HOSTNAME     "Container hostname"            HOSTNAME_CT
+    _prompt STORAGE      "Rootfs storage"
+    _prompt DISK_GB      "Disk size (GB)"
+    _prompt CORES        "CPU cores"
+    _prompt MEMORY_MB    "Memory (MB)"
+    _prompt BRIDGE       "Network bridge"
+
+    # Networking: dhcp or static
+    if [[ -z "${_PROVIDED[IP_CONFIG]:-}" ]]; then
+        local ipmode
+        printf 'Network: dhcp or static? [%s]: ' "$( [[ "$IP_CONFIG" == dhcp ]] && echo dhcp || echo static )"
+        read -r ipmode
+        case "${ipmode,,}" in
+            static)
+                printf 'Static IP with CIDR (e.g. 192.168.1.50/24): '
+                read -r IP_CONFIG
+                [[ -z "${_PROVIDED[GATEWAY]:-}" ]] && { printf 'Gateway (e.g. 192.168.1.1): '; read -r GATEWAY; }
+                ;;
+            dhcp|"") IP_CONFIG="dhcp" ;;
+            *) warn "Unrecognized '$ipmode'; using dhcp."; IP_CONFIG="dhcp" ;;
+        esac
+    fi
+
+    _prompt SUBNET_ROUTES "Subnet routes to advertise (comma-separated)"
+    _prompt_yesno ADVERTISE_EXIT_NODE "Advertise as an exit node?"
+    _prompt TS_AUTHKEY   "Tailscale auth key (blank = interactive login later)" TS_AUTHKEY 1
+
+    echo
+    echo "---------------------------- summary ---------------------------------"
+    printf '  CTID            : %s\n' "$CTID"
+    printf '  Hostname        : %s\n' "$HOSTNAME"
+    printf '  Storage / disk  : %s / %sGB\n' "$STORAGE" "$DISK_GB"
+    printf '  Cores / memory  : %s / %sMB\n' "$CORES" "$MEMORY_MB"
+    printf '  Bridge / network: %s / %s%s\n' "$BRIDGE" "$IP_CONFIG" \
+        "$( [[ "$IP_CONFIG" != dhcp && -n "$GATEWAY" ]] && echo " gw $GATEWAY" )"
+    printf '  Subnet routes   : %s\n' "$SUBNET_ROUTES"
+    printf '  Exit node       : %s\n' "$( [[ "$ADVERTISE_EXIT_NODE" == 1 ]] && echo yes || echo no )"
+    printf '  Auth key        : %s\n' "$( [[ -n "$TS_AUTHKEY" ]] && echo "(set)" || echo "(none - interactive login)" )"
+    echo "----------------------------------------------------------------------"
+    local go
+    printf 'Proceed with install? (yes/no) [yes]: '
+    read -r go
+    case "${go,,}" in
+        n|no) die "Aborted by user." ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -286,6 +393,7 @@ require_host
 
 case "$MODE" in
     install)
+        interactive_setup
         resolve_template
         create_ct
         ensure_tun
