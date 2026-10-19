@@ -16,6 +16,8 @@ Both do the same thing:
 - Map `/dev/net/tun` into the container — the step an unprivileged LXC needs
   before `tailscaled` will run.
 - Enable IPv4 + IPv6 forwarding (required for exit-node / subnet routing).
+- Tune UDP GRO forwarding on the NIC for higher throughput (installs `ethtool`
+  + a `networkd-dispatcher` hook so it persists across reboots).
 - Install Tailscale and bring it up advertising your subnet routes and exit node.
 
 ## Quick start (bash)
