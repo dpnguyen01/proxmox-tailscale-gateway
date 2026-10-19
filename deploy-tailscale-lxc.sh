@@ -408,32 +408,31 @@ sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
 enable_console_autologin() {
     [[ "$CONSOLE_AUTOLOGIN" == "1" ]] || { log "Console autologin disabled; skipping."; return; }
     log "Configuring root autologin on the container console tty."
-    # Debian LXC consoles run two gettys: console-getty (/dev/console, used by
-    # `pct console`) and getty@tty1 (the web-UI Console button attaches here).
-    # Each needs the agetty form that matches ITS device: tty1 is a virtual
-    # console (positional tty + term, no baud list), console is the serial-ish
-    # /dev/console. The earlier one-size form (`--keep-baud - <bauds> $TERM`)
-    # is a serial-line invocation and leaves a login: prompt on tty1.
+    # Two gettys serve a Proxmox Debian LXC console:
+    #   container-getty@.service -> /dev/ttyN, the unit the web-UI Console
+    #                               button (xterm.js, console=lxc) attaches to.
+    #   console-getty.service    -> /dev/console, used by `pct console`.
+    # Both ship an interactive ExecStart of the shape:
+    #   agetty -o '-- \u' --noreset --noclear - ${TERM}
+    # For AUTOLOGIN the `-o '-- \u'` MUST be dropped: `\u` expands to the
+    # *entered* username, which conflicts with --autologin (no username is
+    # entered) and drops you at a Password: prompt. The working form is simply
+    # `--autologin root --noreset --noclear - ${TERM}`. container-getty@ is a
+    # TEMPLATE unit, so the drop-in goes in container-getty@.service.d (covers
+    # @1/@2). ${TERM} is left for systemd/agetty to expand at runtime.
     pct exec "$CTID" -- bash -c '
 set -e
-# getty@tty1 -> virtual console form: positional tty name + term type.
-d1=/etc/systemd/system/getty@tty1.service.d
-mkdir -p "$d1"
-cat >"$d1/autologin.conf" <<EOF
+for d in /etc/systemd/system/container-getty@.service.d \
+         /etc/systemd/system/console-getty.service.d; do
+    mkdir -p "$d"
+    cat >"$d/autologin.conf" <<"CONF"
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear tty1 linux
-EOF
-# console-getty -> /dev/console form.
-d2=/etc/systemd/system/console-getty.service.d
-mkdir -p "$d2"
-cat >"$d2/autologin.conf" <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 vt220
-EOF
+ExecStart=-/sbin/agetty --autologin root --noreset --noclear - ${TERM}
+CONF
+done
 systemctl daemon-reload
-systemctl restart getty@tty1.service 2>/dev/null || true
+systemctl restart container-getty@1.service 2>/dev/null || true
 systemctl restart console-getty.service 2>/dev/null || true
 '
 }
