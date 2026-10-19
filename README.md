@@ -11,7 +11,8 @@ Deploy a Proxmox LXC running [Tailscale](https://tailscale.com) as an
 Both do the same thing:
 
 - Create an **unprivileged** Debian LXC (tracks the **latest** Debian standard
-  template automatically).
+  template automatically, matched to the host CPU architecture — amd64 or
+  arm64).
 - Map `/dev/net/tun` into the container — the step an unprivileged LXC needs
   before `tailscaled` will run.
 - Enable IPv4 + IPv6 forwarding (required for exit-node / subnet routing).
@@ -148,3 +149,16 @@ WireGuard, no GUI or database. The defaults suit a typical home uplink:
 > **Secrets:** never commit a real `TS_AUTHKEY` or Proxmox API token. The
 > `.gitignore` excludes common secret files; use `ansible-vault` for the
 > Ansible path.
+
+## Troubleshooting
+
+**Container is created but fails to start with `Exec format error` / `Failed
+to exec "/sbin/init"` / `sync_wait ... expected sequence number 7`.**
+The container's template architecture does not match the host CPU (e.g. an
+arm64 template on an amd64 host). The script now auto-detects the host arch
+(`dpkg --print-architecture`, falling back to `uname -m`) and only resolves a
+matching template, so a fresh `install` picks the right one. If you pinned
+`TEMPLATE_NAME` by hand, the script rejects a mismatched arch up front — use
+the `_amd64` or `_arm64` template for your host, or unset `TEMPLATE_NAME` to
+auto-resolve. To recover a broken container: `pct destroy <ctid>` then re-run
+`install`.
