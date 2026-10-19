@@ -168,8 +168,8 @@ build_up_args() {
 # default in brackets; empty answer keeps it. `secret=1` hides input.
 _prompt() {
     local var="$1" question="$2" provided_key="${3:-$1}" secret="${4:-0}"
-    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return   # caller already set it
-    local current="${!var}" answer
+    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return 0   # caller already set it
+    local current="${!var}" answer=""
     if [[ "$secret" == "1" ]]; then
         printf '%s [%s]: ' "$question" "${current:+(set)}" >/dev/tty
         read -r -s answer </dev/tty || true; echo >/dev/tty
@@ -177,14 +177,17 @@ _prompt() {
         printf '%s [%s]: ' "$question" "$current" >/dev/tty
         read -r answer </dev/tty || true
     fi
+    # Keep the default when answer is empty. Must not let a false test be the
+    # function's exit status -- under `set -e` that would abort the script.
     [[ -n "$answer" ]] && printf -v "$var" '%s' "$answer"
+    return 0
 }
 
 _prompt_yesno() {
     local var="$1" question="$2" provided_key="${3:-$1}"
-    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return
+    [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return 0
     local def="no"; [[ "${!var}" == "1" ]] && def="yes"
-    local answer
+    local answer=""
     printf '%s (yes/no) [%s]: ' "$question" "$def" >/dev/tty
     read -r answer </dev/tty || true
     case "${answer,,}" in
@@ -193,6 +196,7 @@ _prompt_yesno() {
         "")    : ;;   # keep default
         *)     warn "Unrecognized '$answer'; keeping $def." ;;
     esac
+    return 0
 }
 
 interactive_setup() {
