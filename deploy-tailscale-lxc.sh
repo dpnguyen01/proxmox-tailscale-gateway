@@ -405,6 +405,32 @@ sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
 '
 }
 
+enable_udp_gro() {
+    # Tailscale warns that UDP GRO forwarding is suboptimal on the NIC; enabling
+    # it raises subnet-router / exit-node forwarding throughput and cuts CPU per
+    # packet. Persist via a networkd-dispatcher routable.d hook so it re-applies
+    # on every link-up (and reboot), then apply once now. Idempotent.
+    # Ref: https://tailscale.com/s/ethtool-config-udp-gro
+    log "Tuning UDP GRO forwarding on eth0 (throughput)."
+    pct exec "$CTID" -- bash -c '
+set -e
+export DEBIAN_FRONTEND=noninteractive
+# ethtool is required; networkd-dispatcher makes the setting persist on link-up.
+if ! command -v ethtool >/dev/null || ! dpkg -s networkd-dispatcher >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq ethtool networkd-dispatcher >/dev/null
+fi
+mkdir -p /etc/networkd-dispatcher/routable.d
+cat >/etc/networkd-dispatcher/routable.d/50-tailscale <<EOF
+#!/bin/sh
+ethtool -K eth0 rx-udp-gro-forwarding on rx-gro-list off
+EOF
+chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
+# Apply now; do not fail the run if the NIC/driver does not support the knob.
+/etc/networkd-dispatcher/routable.d/50-tailscale || true
+'
+}
+
 enable_console_autologin() {
     [[ "$CONSOLE_AUTOLOGIN" == "1" ]] || { log "Console autologin disabled; skipping."; return; }
     log "Configuring root autologin on the container console tty."
@@ -538,6 +564,7 @@ case "$MODE" in
         ensure_tun
         ensure_ct_running
         enable_forwarding
+        enable_udp_gro
         install_tailscale
         enable_console_autologin
         tailscale_up
@@ -549,6 +576,7 @@ case "$MODE" in
         upgrade_tailscale
         [[ "$APT_DIST_UPGRADE" == "1" ]] && apt_dist_upgrade
         enable_forwarding      # re-assert in case a package reset sysctl
+        enable_udp_gro         # re-assert the GRO hook too
         tailscale_up           # re-apply current route/exit config
         post_notes
         ;;
@@ -556,6 +584,7 @@ case "$MODE" in
         require_ct
         ensure_ct_running
         enable_forwarding
+        enable_udp_gro
         tailscale_up
         post_notes
         ;;
