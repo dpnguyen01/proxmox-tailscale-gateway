@@ -112,6 +112,27 @@ require_host() {
     command -v pct >/dev/null || die "'pct' not found -- this must run on a Proxmox VE host."
 }
 
+# The host's CT-template architecture token, as it appears in template names
+# (amd64 / arm64). A container's /sbin/init must match the host CPU or it fails
+# to start with "Exec format error" -- so we only ever pick a template whose
+# arch matches the host. Prefer dpkg's view (Debian's own arch name); fall back
+# to mapping `uname -m`.
+host_template_arch() {
+    local a=""
+    if command -v dpkg >/dev/null; then
+        a="$(dpkg --print-architecture 2>/dev/null)"
+    fi
+    if [[ -z "$a" ]]; then
+        case "$(uname -m)" in
+            x86_64|amd64)        a="amd64" ;;
+            aarch64|arm64)       a="arm64" ;;
+            armv7l|armhf)        a="armhf" ;;
+            *)                   a="$(uname -m)" ;;
+        esac
+    fi
+    echo "$a"
+}
+
 # Lowest free container ID >= 100. Prefer Proxmox's own allocator; fall back to
 # scanning `pct list` if pvesh is unavailable.
 next_free_ctid() {
@@ -293,14 +314,30 @@ interactive_setup() {
 
 resolve_template() {
     pveam update >/dev/null 2>&1 || true
+    local arch; arch="$(host_template_arch)"
     if [[ -z "$TEMPLATE_NAME" ]]; then
-        log "Resolving latest Debian standard template from pveam."
+        log "Resolving latest Debian standard template for host arch '$arch'."
+        # Filter to the HOST architecture. pveam lists templates for every
+        # arch; a mismatched template builds a container whose /sbin/init the
+        # host CPU cannot exec ("Exec format error"), so match arch explicitly.
         TEMPLATE_NAME="$(pveam available --section system \
             | awk '{print $2}' \
-            | grep -E '^debian-[0-9]+-standard' \
+            | grep -E "^debian-[0-9]+-standard.*_${arch}\." \
             | sort -V | tail -n1)"
-        [[ -n "$TEMPLATE_NAME" ]] || die "Could not resolve a Debian template. See: pveam available --section system"
+        if [[ -z "$TEMPLATE_NAME" ]]; then
+            die "No debian-*-standard template for arch '$arch' in: pveam available --section system
+(If your host arch token differs, pin it: TEMPLATE_NAME=debian-XX-standard_..._<arch>.tar.zst)"
+        fi
         log "Latest Debian template: $TEMPLATE_NAME"
+    else
+        # A manual pin that doesn't match the host arch is the exact failure we
+        # are fixing -- reject it loudly instead of building a dead container.
+        if [[ "$TEMPLATE_NAME" != *"_${arch}."* ]]; then
+            die "Pinned TEMPLATE_NAME '$TEMPLATE_NAME' does not match host arch '$arch'.
+A container built from a mismatched-arch template fails to start with
+'Exec format error'. Pick the _${arch} template, or unset TEMPLATE_NAME to
+auto-resolve the right one."
+        fi
     fi
     if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_NAME"; then
         log "Template $TEMPLATE_NAME not present; downloading."
