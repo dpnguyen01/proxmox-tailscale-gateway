@@ -81,7 +81,11 @@ UNPRIVILEGED="${UNPRIVILEGED:-1}"          # 1 = unprivileged (recommended)
 
 # --- Tailscale config ---
 TS_AUTHKEY="${TS_AUTHKEY:-}"               # auth key (unattended up); optional on upgrade/reconfigure
-SUBNET_ROUTES="${SUBNET_ROUTES:-192.168.1.0/24}"   # comma-separated subnets
+# Comma-separated CIDRs to advertise. Any mix of prefix lengths is allowed:
+# a single host "192.168.68.55/32", a whole subnet "192.168.68.0/24", or a
+# combination "192.168.68.0/24,10.0.0.0/24,192.168.68.55/32". Blank = advertise
+# no subnet routes (exit-node-only is still valid).
+SUBNET_ROUTES="${SUBNET_ROUTES:-}"   # comma-separated CIDRs (any /length), blank = none
 ADVERTISE_EXIT_NODE="${ADVERTISE_EXIT_NODE:-1}"    # 1 = advertise exit node
 TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"         # extra `tailscale up` flags (e.g. --ssh to enable Tailscale SSH)
 
@@ -174,10 +178,44 @@ ensure_ct_running() {
 
 # Build the `tailscale up` argument array from current config.
 build_up_args() {
+    validate_subnet_routes
+    # Always pass --advertise-routes so re-running reconciles declaratively:
+    # a value sets exactly those routes, and an empty value CLEARS them (you
+    # changed from a /24 to nothing). Mixed prefix lengths pass through as-is.
     UP_ARGS=(--advertise-routes="${SUBNET_ROUTES}")
     [[ "$ADVERTISE_EXIT_NODE" == "1" ]] && UP_ARGS+=(--advertise-exit-node)
     # shellcheck disable=SC2206
     [[ -n "$TS_EXTRA_ARGS" ]] && UP_ARGS+=($TS_EXTRA_ARGS)
+}
+
+# Light sanity check on each comma-separated CIDR: IPv4 a.b.c.d/len or IPv6
+# containing ':' with a /len. Warns (does not abort) so a typo like
+# "192.168.68.0/42" or a missing /len is caught before it is advertised.
+validate_subnet_routes() {
+    [[ -n "$SUBNET_ROUTES" ]] || return 0
+    local r bad=0
+    local IFS=','
+    for r in $SUBNET_ROUTES; do
+        r="${r// /}"
+        [[ -z "$r" ]] && continue
+        if [[ "$r" == *:* ]]; then
+            # IPv6: require a /prefix 0-128.
+            [[ "$r" =~ ^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || { warn "Route '$r' does not look like a valid IPv6 CIDR."; bad=1; }
+        else
+            # IPv4: four 0-255 octets and a /prefix 0-32.
+            if [[ "$r" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+                local o
+                for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+                    (( o <= 255 )) || { warn "Route '$r' has an octet > 255."; bad=1; break; }
+                done
+            else
+                warn "Route '$r' does not look like a valid IPv4 CIDR (expected a.b.c.d/len)."
+                bad=1
+            fi
+        fi
+    done
+    [[ "$bad" == "0" ]] || warn "Continuing anyway -- fix SUBNET_ROUTES and re-run 'reconfigure' if a route is wrong."
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -283,7 +321,14 @@ interactive_setup() {
     fi
 
     echo "  (tip: a gateway you depend on is best on a static IP or DHCP reservation)"
-    _prompt SUBNET_ROUTES "Subnet routes to advertise (comma-separated)"
+    echo
+    echo "  Subnet routes: which LAN addresses this gateway makes reachable over"
+    echo "  the tailnet. Comma-separated, any mix of prefix lengths:"
+    echo "    one host    192.168.68.55/32"
+    echo "    whole LAN   192.168.68.0/24   (exposes everything on it -- gate in ACLs)"
+    echo "    a mix       192.168.68.0/24,10.0.0.0/24,192.168.68.55/32"
+    echo "  Leave blank for an exit-node-only gateway (no subnet routes)."
+    _prompt SUBNET_ROUTES "Subnet routes to advertise"
     _prompt_yesno ADVERTISE_EXIT_NODE "Advertise as an exit node?"
     _prompt TS_AUTHKEY   "Tailscale auth key (blank = interactive login later)" TS_AUTHKEY 1
 

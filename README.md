@@ -136,6 +136,24 @@ Leave `CTID` unset and the script auto-picks the **next free container ID**
 (≥ 100, via `pvesh get /cluster/nextid`); the interactive screen shows the
 picked ID as its default.
 
+### Subnet routes (`SUBNET_ROUTES`)
+
+Comma-separated CIDRs, **any mix of prefix lengths** — this is what the gateway
+makes reachable over the tailnet:
+
+| You want | Set `SUBNET_ROUTES` to |
+|----------|------------------------|
+| One host (e.g. a Jellyfin box) | `192.168.68.55/32` |
+| A whole LAN | `192.168.68.0/24` (exposes everything on it — scope it in Tailscale ACLs) |
+| A combination | `192.168.68.0/24,10.0.0.0/24,192.168.68.55/32` |
+| Exit-node only, no subnet routes | leave it blank |
+
+The script lightly validates each CIDR and **warns** (does not abort) on a
+malformed entry — a bad prefix length, an octet > 255, or a missing `/len`.
+`tailscale up` is declarative, so changing `SUBNET_ROUTES` and running
+`reconfigure` **replaces** the advertised set (and a blank value clears it).
+After any change, re-approve the new routes in the admin console.
+
 ### Resource sizing (defaults + why)
 
 A Tailscale exit-node / subnet-router is a **light** workload — userspace
