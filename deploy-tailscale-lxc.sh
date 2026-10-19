@@ -171,11 +171,11 @@ _prompt() {
     [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return   # caller already set it
     local current="${!var}" answer
     if [[ "$secret" == "1" ]]; then
-        printf '%s [%s]: ' "$question" "${current:+(set)}"
-        read -r -s answer; echo
+        printf '%s [%s]: ' "$question" "${current:+(set)}" >/dev/tty
+        read -r -s answer </dev/tty; echo >/dev/tty
     else
-        printf '%s [%s]: ' "$question" "$current"
-        read -r answer
+        printf '%s [%s]: ' "$question" "$current" >/dev/tty
+        read -r answer </dev/tty
     fi
     [[ -n "$answer" ]] && printf -v "$var" '%s' "$answer"
 }
@@ -185,8 +185,8 @@ _prompt_yesno() {
     [[ -n "${_PROVIDED[$provided_key]:-}" ]] && return
     local def="no"; [[ "${!var}" == "1" ]] && def="yes"
     local answer
-    printf '%s (yes/no) [%s]: ' "$question" "$def"
-    read -r answer
+    printf '%s (yes/no) [%s]: ' "$question" "$def" >/dev/tty
+    read -r answer </dev/tty
     case "${answer,,}" in
         y|yes) printf -v "$var" '1' ;;
         n|no)  printf -v "$var" '0' ;;
@@ -196,10 +196,16 @@ _prompt_yesno() {
 }
 
 interactive_setup() {
-    # Skip when explicitly non-interactive or not attached to a terminal
-    # (e.g. piped via `bash -c "$(curl ...)"` without a TTY).
+    # Skip when explicitly non-interactive, or when no controlling terminal is
+    # available to read from. We read prompts from /dev/tty (not stdin) so the
+    # screen works even when launched as `bash -c "$(curl ...)"`, where the
+    # script's stdin is NOT the keyboard.
     [[ "$NONINTERACTIVE" == "1" ]] && return
-    [[ -t 0 ]] || { warn "No TTY -- skipping interactive setup, using env/defaults."; return; }
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        warn "No controlling terminal -- skipping interactive setup, using env/defaults."
+        return
+    fi
+    exec 3>&-   # close probe fd; helpers open /dev/tty directly
 
     echo
     echo "======================================================================"
@@ -213,8 +219,8 @@ interactive_setup() {
     # CTID: blank default means "auto-pick the next free ID" -- show that.
     if [[ -z "${_PROVIDED[CTID]:-}" ]]; then
         local _suggested_ctid; _suggested_ctid="$(next_free_ctid 2>/dev/null || true)"
-        printf 'Container ID (CTID) -- blank = next free [%s]: ' "${_suggested_ctid:-auto}"
-        local _ctid_ans; read -r _ctid_ans
+        printf 'Container ID (CTID) -- blank = next free [%s]: ' "${_suggested_ctid:-auto}" >/dev/tty
+        local _ctid_ans; read -r _ctid_ans </dev/tty
         [[ -n "$_ctid_ans" ]] && CTID="$_ctid_ans"
     fi
 
@@ -238,13 +244,13 @@ interactive_setup() {
     # Networking: dhcp or static
     if [[ -z "${_PROVIDED[IP_CONFIG]:-}" ]]; then
         local ipmode
-        printf 'Network: dhcp or static? [%s]: ' "$( [[ "$IP_CONFIG" == dhcp ]] && echo dhcp || echo static )"
-        read -r ipmode
+        printf 'Network: dhcp or static? [%s]: ' "$( [[ "$IP_CONFIG" == dhcp ]] && echo dhcp || echo static )" >/dev/tty
+        read -r ipmode </dev/tty
         case "${ipmode,,}" in
             static)
-                printf 'Static IP with CIDR (e.g. 192.168.1.50/24): '
-                read -r IP_CONFIG
-                [[ -z "${_PROVIDED[GATEWAY]:-}" ]] && { printf 'Gateway (e.g. 192.168.1.1): '; read -r GATEWAY; }
+                printf 'Static IP with CIDR (e.g. 192.168.1.50/24): ' >/dev/tty
+                read -r IP_CONFIG </dev/tty
+                [[ -z "${_PROVIDED[GATEWAY]:-}" ]] && { printf 'Gateway (e.g. 192.168.1.1): ' >/dev/tty; read -r GATEWAY </dev/tty; }
                 ;;
             dhcp|"") IP_CONFIG="dhcp" ;;
             *) warn "Unrecognized '$ipmode'; using dhcp."; IP_CONFIG="dhcp" ;;
@@ -270,8 +276,8 @@ interactive_setup() {
     printf '  Auth key        : %s\n' "$( [[ -n "$TS_AUTHKEY" ]] && echo "(set)" || echo "(none - interactive login)" )"
     echo "----------------------------------------------------------------------"
     local go
-    printf 'Proceed with install? (yes/no) [yes]: '
-    read -r go
+    printf 'Proceed with install? (yes/no) [yes]: ' >/dev/tty
+    read -r go </dev/tty
     case "${go,,}" in
         n|no) die "Aborted by user." ;;
     esac
