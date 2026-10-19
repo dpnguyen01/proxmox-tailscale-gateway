@@ -2,36 +2,55 @@
 #
 # deploy-tailscale-lxc.sh
 #
-# Create a Debian 12 LXC on Proxmox and provision Tailscale inside it,
-# ready to act as an EXIT NODE and SUBNET ROUTER.
+# Create and MAINTAIN a Debian LXC on Proxmox running Tailscale as an
+# EXIT NODE and SUBNET ROUTER. Tracks the latest Debian standard template.
 #
 # RUN THIS ON THE PROXMOX HOST (as root).
 #
-# What it does:
-#   1. Downloads the Debian 12 LXC template if missing.
-#   2. Creates the container with the resources you specify.
-#   3. Enables the TUN device inside the container (required by Tailscale),
-#      and nesting (needed for the systemd-based tailscaled service).
-#   4. Starts the container, installs Tailscale, enables IPv4 + IPv6
-#      forwarding (required for exit-node / subnet routing).
-#   5. Brings Tailscale up advertising your exit node and the subnet routes.
+# ---------------------------------------------------------------------------
+# MODES  (first positional arg, or MODE=... ; default: install)
+# ---------------------------------------------------------------------------
+#   install      Create the container if absent, map the TUN device, install
+#                Tailscale, enable forwarding, bring it up. Idempotent: safe to
+#                re-run; skips steps already done.
 #
-# After it runs you approve the node + routes in the Tailscale admin console
-# (https://login.tailscale.com/admin/machines) -- "Edit route settings" ->
-# enable the subnet routes and "Use as exit node".
+#   upgrade      Upgrade an EXISTING container: upgrade the Tailscale package
+#                to the latest, re-apply forwarding + the current `tailscale up`
+#                config, and (optionally, APT_DIST_UPGRADE=1) apt dist-upgrade
+#                the OS. Does NOT recreate the container and does NOT do a
+#                Debian major-version jump (see NOTE below).
 #
-# Re-run safe: skips template download and container creation if they exist.
+#   reconfigure  Re-apply `tailscale up` with the CURRENT SUBNET_ROUTES /
+#                ADVERTISE_EXIT_NODE / TS_EXTRA_ARGS on the existing node.
+#                No package changes. Use after changing routes or toggling
+#                the exit node. Tailscale 'up' is declarative and reconciles.
+#
+#   status       Print container + Tailscale status. Read-only.
+#
+# NOTE on Debian MAJOR upgrades (e.g. 12 -> 13): deliberately NOT automated.
+# In-place dist release upgrades of an LXC are risky; the clean path is to
+# build a FRESH container on the new template and re-point Tailscale. To do
+# that: pick a new CTID, run `install` (it auto-selects the latest template),
+# then retire the old container. `upgrade` only moves packages within the
+# installed release.
+#
+# Examples:
+#   ./deploy-tailscale-lxc.sh install
+#   SUBNET_ROUTES="10.0.0.0/24,192.168.1.0/24" ./deploy-tailscale-lxc.sh reconfigure
+#   APT_DIST_UPGRADE=1 ./deploy-tailscale-lxc.sh upgrade
+#   MODE=status ./deploy-tailscale-lxc.sh
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# CONFIG -- edit these, or override any of them on the command line as
-#          KEY=value environment variables, e.g.:
-#          CTID=150 SUBNET_ROUTES="10.0.0.0/24,192.168.1.0/24" ./deploy-tailscale-lxc.sh
+# CONFIG -- edit, or override as KEY=value env vars.
 # ---------------------------------------------------------------------------
 
+# --- Mode ---
+MODE="${1:-${MODE:-install}}"
+
 # --- Container identity / resources ---
-CTID="${CTID:-150}"                       # Proxmox container ID (must be unused)
+CTID="${CTID:-150}"                       # Proxmox container ID
 HOSTNAME="${HOSTNAME_CT:-tailscale-gw}"   # container hostname
 STORAGE="${STORAGE:-local-lvm}"           # storage for the rootfs
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}" # storage holding CT templates
@@ -45,112 +64,125 @@ IP_CONFIG="${IP_CONFIG:-dhcp}"
 GATEWAY="${GATEWAY:-}"                      # e.g. 192.168.1.1 (only if static IP)
 
 # --- Unprivileged vs privileged ---
-# Unprivileged (1) is safer and works fine for Tailscale once TUN is mapped.
-UNPRIVILEGED="${UNPRIVILEGED:-1}"
+UNPRIVILEGED="${UNPRIVILEGED:-1}"          # 1 = unprivileged (recommended)
 
 # --- Tailscale config ---
-# Auth key from https://login.tailscale.com/admin/settings/keys
-# Reusable + pre-authorized is handy for re-deploys. REQUIRED for unattended up.
-TS_AUTHKEY="${TS_AUTHKEY:-}"
-# Comma-separated subnets this node advertises for subnet routing.
-# Set to the LAN(s) behind this box, e.g. "192.168.1.0/24,10.10.0.0/16"
-SUBNET_ROUTES="${SUBNET_ROUTES:-192.168.1.0/24}"
-# Advertise as an exit node (1) or not (0)
-ADVERTISE_EXIT_NODE="${ADVERTISE_EXIT_NODE:-1}"
-# Extra flags passed verbatim to `tailscale up` (e.g. --accept-dns=false)
-TS_EXTRA_ARGS="${TS_EXTRA_ARGS:---ssh}"
+TS_AUTHKEY="${TS_AUTHKEY:-}"               # auth key (unattended up); optional on upgrade/reconfigure
+SUBNET_ROUTES="${SUBNET_ROUTES:-192.168.1.0/24}"   # comma-separated subnets
+ADVERTISE_EXIT_NODE="${ADVERTISE_EXIT_NODE:-1}"    # 1 = advertise exit node
+TS_EXTRA_ARGS="${TS_EXTRA_ARGS:---ssh}"            # extra `tailscale up` flags
+
+# --- Upgrade behavior ---
+APT_DIST_UPGRADE="${APT_DIST_UPGRADE:-0}"  # 1 = also apt dist-upgrade the OS on 'upgrade'
 
 # --- Template ---
-# Leave empty to auto-pick the LATEST debian-*-standard template (tracks the
-# newest stable release). Set explicitly to pin, e.g.
-# TEMPLATE_NAME="debian-13-standard_13.0-1_amd64.tar.zst"
+# Empty => auto-pick the latest debian-*-standard template. Pin to override.
 TEMPLATE_NAME="${TEMPLATE_NAME:-}"
 
 # ---------------------------------------------------------------------------
-# Implementation
+# Helpers
 # ---------------------------------------------------------------------------
 
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "Run this on the Proxmox host as root."
-command -v pct >/dev/null || die "'pct' not found -- this must run on a Proxmox VE host."
+require_host() {
+    [[ $EUID -eq 0 ]] || die "Run this on the Proxmox host as root."
+    command -v pct >/dev/null || die "'pct' not found -- this must run on a Proxmox VE host."
+}
 
-# 1. Template --------------------------------------------------------------
-pveam update >/dev/null 2>&1 || true
+ct_exists()  { pct status "$CTID" >/dev/null 2>&1; }
+ct_running() { pct status "$CTID" 2>/dev/null | grep -q running; }
 
-if [[ -z "$TEMPLATE_NAME" ]]; then
-    log "Resolving latest Debian standard template from pveam."
-    TEMPLATE_NAME="$(pveam available --section system \
-        | awk '{print $2}' \
-        | grep -E '^debian-[0-9]+-standard' \
-        | sort -V | tail -n1)"
-    [[ -n "$TEMPLATE_NAME" ]] || die "Could not resolve a Debian template. See: pveam available --section system"
-    log "Latest Debian template: $TEMPLATE_NAME"
-fi
+require_ct() {
+    ct_exists || die "Container $CTID does not exist. Run 'install' first."
+}
 
-if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_NAME"; then
-    log "Template $TEMPLATE_NAME not present; downloading."
-    pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME" \
-        || die "Failed to download $TEMPLATE_NAME. List options with: pveam available --section system"
-else
-    log "Template $TEMPLATE_NAME already present."
-fi
-TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}"
+ensure_ct_running() {
+    ct_running || { log "Starting container $CTID."; pct start "$CTID"; sleep 5; }
+}
 
-# 2. Create container ------------------------------------------------------
-if pct status "$CTID" >/dev/null 2>&1; then
-    warn "Container $CTID already exists; skipping creation."
-else
-    log "Creating container $CTID ($HOSTNAME)."
-    NET0="name=eth0,bridge=${BRIDGE}"
-    if [[ "$IP_CONFIG" == "dhcp" ]]; then
-        NET0="${NET0},ip=dhcp"
-    else
-        NET0="${NET0},ip=${IP_CONFIG}"
-        [[ -n "$GATEWAY" ]] && NET0="${NET0},gw=${GATEWAY}"
+# Build the `tailscale up` argument array from current config.
+build_up_args() {
+    UP_ARGS=(--advertise-routes="${SUBNET_ROUTES}")
+    [[ "$ADVERTISE_EXIT_NODE" == "1" ]] && UP_ARGS+=(--advertise-exit-node)
+    # shellcheck disable=SC2206
+    [[ -n "$TS_EXTRA_ARGS" ]] && UP_ARGS+=($TS_EXTRA_ARGS)
+}
+
+# ---------------------------------------------------------------------------
+# Steps (each idempotent)
+# ---------------------------------------------------------------------------
+
+resolve_template() {
+    pveam update >/dev/null 2>&1 || true
+    if [[ -z "$TEMPLATE_NAME" ]]; then
+        log "Resolving latest Debian standard template from pveam."
+        TEMPLATE_NAME="$(pveam available --section system \
+            | awk '{print $2}' \
+            | grep -E '^debian-[0-9]+-standard' \
+            | sort -V | tail -n1)"
+        [[ -n "$TEMPLATE_NAME" ]] || die "Could not resolve a Debian template. See: pveam available --section system"
+        log "Latest Debian template: $TEMPLATE_NAME"
     fi
+    if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_NAME"; then
+        log "Template $TEMPLATE_NAME not present; downloading."
+        pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME" \
+            || die "Failed to download $TEMPLATE_NAME. List options with: pveam available --section system"
+    else
+        log "Template $TEMPLATE_NAME already present."
+    fi
+    TEMPLATE_REF="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}"
+}
 
+create_ct() {
+    if ct_exists; then
+        warn "Container $CTID already exists; skipping creation."
+        return
+    fi
+    log "Creating container $CTID ($HOSTNAME)."
+    local net0="name=eth0,bridge=${BRIDGE}"
+    if [[ "$IP_CONFIG" == "dhcp" ]]; then
+        net0="${net0},ip=dhcp"
+    else
+        net0="${net0},ip=${IP_CONFIG}"
+        [[ -n "$GATEWAY" ]] && net0="${net0},gw=${GATEWAY}"
+    fi
     pct create "$CTID" "$TEMPLATE_REF" \
         --hostname "$HOSTNAME" \
         --cores "$CORES" \
         --memory "$MEMORY_MB" \
         --swap "$SWAP_MB" \
         --rootfs "${STORAGE}:${DISK_GB}" \
-        --net0 "$NET0" \
+        --net0 "$net0" \
         --unprivileged "$UNPRIVILEGED" \
         --features nesting=1 \
         --onboot 1 \
         --ostype debian
-fi
-
-# 3. Enable TUN device + lxc.cap for the container -------------------------
-# Tailscale needs /dev/net/tun. We append the mount + cgroup allow to the
-# container's config on the host. Idempotent: only add lines not present.
-CONF="/etc/pve/lxc/${CTID}.conf"
-log "Ensuring TUN device access in $CONF"
-
-add_conf_line() {
-    local line="$1"
-    grep -qxF "$line" "$CONF" || echo "$line" >> "$CONF"
 }
 
-add_conf_line "lxc.cgroup2.devices.allow: c 10:200 rwm"
-add_conf_line "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file"
+ensure_tun() {
+    # Tailscale needs /dev/net/tun; map it into the (unprivileged) container.
+    local conf="/etc/pve/lxc/${CTID}.conf"
+    local changed=0
+    log "Ensuring TUN device access in $conf"
+    _add_line() {
+        grep -qxF "$1" "$conf" || { echo "$1" >> "$conf"; changed=1; }
+    }
+    _add_line "lxc.cgroup2.devices.allow: c 10:200 rwm"
+    _add_line "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file"
+    if [[ "$changed" == "1" ]]; then
+        log "Device config changed; restarting container to apply."
+        pct stop "$CTID" >/dev/null 2>&1 || true
+        pct start "$CTID"
+        sleep 5
+    fi
+}
 
-log "Restarting container to apply device config."
-pct stop "$CTID" >/dev/null 2>&1 || true
-pct start "$CTID"
-
-# Give it a moment to get networking up.
-sleep 5
-
-# 4. Provision inside the container ----------------------------------------
-log "Installing Tailscale inside container $CTID."
-
-# Enable IP forwarding (persistent) -- required for subnet routing + exit node.
-pct exec "$CTID" -- bash -c '
+enable_forwarding() {
+    log "Enabling IPv4 + IPv6 forwarding (persistent)."
+    pct exec "$CTID" -- bash -c '
 set -e
 cat >/etc/sysctl.d/99-tailscale.conf <<EOF
 net.ipv4.ip_forward = 1
@@ -158,55 +190,131 @@ net.ipv6.conf.all.forwarding = 1
 EOF
 sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
 '
+}
 
-# Install Tailscale from the official repo.
-pct exec "$CTID" -- bash -c '
+install_tailscale() {
+    log "Installing Tailscale inside container $CTID (if not present)."
+    pct exec "$CTID" -- bash -c '
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates >/dev/null
-curl -fsSL https://tailscale.com/install.sh | sh
+if ! command -v tailscale >/dev/null; then
+    curl -fsSL https://tailscale.com/install.sh | sh
+fi
 systemctl enable --now tailscaled
 '
+}
 
-# 5. Bring Tailscale up ----------------------------------------------------
-UP_ARGS=(--advertise-routes="${SUBNET_ROUTES}")
-[[ "$ADVERTISE_EXIT_NODE" == "1" ]] && UP_ARGS+=(--advertise-exit-node)
-# shellcheck disable=SC2206
-[[ -n "$TS_EXTRA_ARGS" ]] && UP_ARGS+=($TS_EXTRA_ARGS)
+upgrade_tailscale() {
+    log "Upgrading Tailscale package to the latest available."
+    pct exec "$CTID" -- bash -c '
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --only-upgrade tailscale
+systemctl restart tailscaled
+tailscale version
+'
+}
 
-if [[ -n "$TS_AUTHKEY" ]]; then
-    log "Running 'tailscale up' with auth key (unattended)."
-    pct exec "$CTID" -- tailscale up \
-        --authkey="$TS_AUTHKEY" \
-        "${UP_ARGS[@]}"
-    log "Tailscale is up. Node status:"
-    pct exec "$CTID" -- tailscale status || true
-else
-    warn "No TS_AUTHKEY set -- running 'tailscale up' interactively."
-    warn "A login URL will print below; open it in a browser to authenticate."
-    pct exec "$CTID" -- tailscale up "${UP_ARGS[@]}" || true
-fi
+apt_dist_upgrade() {
+    log "Running apt dist-upgrade inside the container (OS packages)."
+    pct exec "$CTID" -- bash -c '
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get -y -qq dist-upgrade
+apt-get -y -qq autoremove
+'
+}
 
-cat <<EOF
+tailscale_up() {
+    build_up_args
+    if [[ -n "$TS_AUTHKEY" ]]; then
+        log "Applying 'tailscale up' with auth key: ${UP_ARGS[*]}"
+        pct exec "$CTID" -- tailscale up --authkey="$TS_AUTHKEY" "${UP_ARGS[@]}"
+    elif pct exec "$CTID" -- tailscale status >/dev/null 2>&1; then
+        # Already authenticated -- reconcile config without a key.
+        log "Applying 'tailscale up' (already authenticated): ${UP_ARGS[*]}"
+        pct exec "$CTID" -- tailscale up "${UP_ARGS[@]}"
+    else
+        warn "No TS_AUTHKEY and node not yet authenticated -- interactive login."
+        warn "A login URL will print below; open it in a browser."
+        pct exec "$CTID" -- tailscale up "${UP_ARGS[@]}" || true
+    fi
+}
+
+print_status() {
+    require_ct
+    echo "=== Proxmox container $CTID ==="
+    pct status "$CTID" || true
+    if ct_running; then
+        echo "=== tailscale version ==="
+        pct exec "$CTID" -- tailscale version || true
+        echo "=== tailscale status ==="
+        pct exec "$CTID" -- tailscale status || true
+    fi
+}
+
+post_notes() {
+    cat <<EOF
 
 ------------------------------------------------------------------------
-Done. Container $CTID ($HOSTNAME) is provisioned.
+Mode: $MODE  |  Container $CTID ($HOSTNAME)
 
 Advertised subnet routes : ${SUBNET_ROUTES}
 Advertised exit node     : $( [[ "$ADVERTISE_EXIT_NODE" == "1" ]] && echo yes || echo no )
 
-NEXT STEP (one-time, in the Tailscale admin console):
+One-time in the Tailscale admin console (new nodes / new routes):
   https://login.tailscale.com/admin/machines
-  Find "$HOSTNAME" -> "..." -> Edit route settings:
-    * enable the subnet routes
-    * tick "Use as exit node"
+  Find "$HOSTNAME" -> Edit route settings: enable the subnet routes,
+  tick "Use as exit node", and disable key expiry (it's infrastructure).
 
-Then disable key expiry on this node (it's infrastructure):
-  admin console -> the node -> Disable key expiry.
-
-Verify from the container:
+Verify:
   pct exec $CTID -- tailscale status
   pct exec $CTID -- tailscale netcheck
 ------------------------------------------------------------------------
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# Mode dispatch
+# ---------------------------------------------------------------------------
+
+require_host
+
+case "$MODE" in
+    install)
+        resolve_template
+        create_ct
+        ensure_tun
+        ensure_ct_running
+        enable_forwarding
+        install_tailscale
+        tailscale_up
+        post_notes
+        ;;
+    upgrade)
+        require_ct
+        ensure_ct_running
+        upgrade_tailscale
+        [[ "$APT_DIST_UPGRADE" == "1" ]] && apt_dist_upgrade
+        enable_forwarding      # re-assert in case a package reset sysctl
+        tailscale_up           # re-apply current route/exit config
+        post_notes
+        ;;
+    reconfigure)
+        require_ct
+        ensure_ct_running
+        enable_forwarding
+        tailscale_up
+        post_notes
+        ;;
+    status)
+        print_status
+        ;;
+    *)
+        die "Unknown MODE '$MODE'. Use: install | upgrade | reconfigure | status"
+        ;;
+esac
