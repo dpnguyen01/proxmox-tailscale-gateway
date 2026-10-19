@@ -28,37 +28,47 @@ SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" \
 
 ### Run directly from the Proxmox host shell (no manual copy)
 
-Paste this into the Proxmox **host** shell (as root). It downloads the latest
-script from this repo and runs `install`.
-
-With **no variables set**, `install` drops into an interactive **setup screen**
-that prompts for each setting (CTID, hostname, storage, network, subnet routes,
-exit-node toggle, auth key — hidden input), shows a summary, and asks you to
-confirm before building:
+Paste this into the Proxmox **host** shell (as root) — the standard Proxmox
+helper-script one-liner. It downloads and runs the script; with **no variables
+set**, `install` drops into an interactive **setup screen** that prompts for
+each setting (CTID, hostname, storage, network, subnet routes, exit-node
+toggle, auth key — hidden input), shows a summary, and asks you to confirm
+before building:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh \
-  -o /root/deploy-tailscale-lxc.sh
-chmod +x /root/deploy-tailscale-lxc.sh
-/root/deploy-tailscale-lxc.sh install        # interactive setup screen
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh)"
 ```
+
+This form keeps your terminal attached, so the setup screen can prompt. (`curl
+… | bash` would starve the prompts of stdin — use the `bash -c "$(…)"` form.)
+To pass a non-default mode, append it after a `_` placeholder (which becomes
+`$0`), e.g. `… )" _ upgrade`.
 
 Prefer to pre-fill some or all answers? Set them as env vars first — any value
 you provide is **not** prompted for; only the rest are asked:
 
 ```bash
 SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" CTID="150" \
-  /root/deploy-tailscale-lxc.sh install
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh)"
 ```
 
-For fully unattended runs (CI, or piped with no terminal), set
-`NONINTERACTIVE=1` (the script also auto-skips the screen when there is no TTY)
-and provide everything via env vars:
+For fully unattended runs (CI, or no terminal), set `NONINTERACTIVE=1` (the
+script also auto-skips the screen when there is no TTY) and provide everything
+via env vars:
 
 ```bash
 NONINTERACTIVE=1 SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" CTID="150" \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh)" _ install
+```
+
+Or fetch-then-run if you'd rather keep a local copy to review and reuse:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh \
+  -o /root/deploy-tailscale-lxc.sh
+chmod +x /root/deploy-tailscale-lxc.sh
+/root/deploy-tailscale-lxc.sh install
 ```
 
 Later, to upgrade or re-point routes, reuse the saved copy (these modes are
