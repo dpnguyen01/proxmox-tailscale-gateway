@@ -83,10 +83,17 @@ UNPRIVILEGED="${UNPRIVILEGED:-1}"          # 1 = unprivileged (recommended)
 TS_AUTHKEY="${TS_AUTHKEY:-}"               # auth key (unattended up); optional on upgrade/reconfigure
 SUBNET_ROUTES="${SUBNET_ROUTES:-192.168.1.0/24}"   # comma-separated subnets
 ADVERTISE_EXIT_NODE="${ADVERTISE_EXIT_NODE:-1}"    # 1 = advertise exit node
-TS_EXTRA_ARGS="${TS_EXTRA_ARGS:---ssh}"            # extra `tailscale up` flags
+TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"         # extra `tailscale up` flags (e.g. --ssh to enable Tailscale SSH)
 
 # --- Upgrade behavior ---
 APT_DIST_UPGRADE="${APT_DIST_UPGRADE:-0}"  # 1 = also apt dist-upgrade the OS on 'upgrade'
+
+# --- Console ---
+# 1 = auto-login root on the Proxmox console tty (web-UI Console button /
+# `pct console`), so it opens a shell with no login prompt. `pct enter` is
+# already password-less; this makes the console match it. Anyone with Proxmox
+# access can already `pct enter` as root, so this does not widen that.
+CONSOLE_AUTOLOGIN="${CONSOLE_AUTOLOGIN:-1}"
 
 # --- Template ---
 # Empty => auto-pick the latest debian-*-standard template. Pin to override.
@@ -351,6 +358,29 @@ sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
 '
 }
 
+enable_console_autologin() {
+    [[ "$CONSOLE_AUTOLOGIN" == "1" ]] || { log "Console autologin disabled; skipping."; return; }
+    log "Configuring root autologin on the container console tty."
+    # Debian LXC consoles run console-getty (/dev/console, used by the web-UI
+    # Console button and `pct console`) and getty@tty1. Override both gettys'
+    # ExecStart with --autologin root via a systemd drop-in, so the console
+    # opens a root shell with no login prompt.
+    pct exec "$CTID" -- bash -c '
+set -e
+for unit in console-getty.service "getty@tty1.service"; do
+    dir="/etc/systemd/system/${unit}.d"
+    mkdir -p "$dir"
+    cat >"$dir/autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud - 115200,38400,9600 \$TERM
+EOF
+done
+systemctl daemon-reload
+systemctl restart console-getty.service 2>/dev/null || true
+'
+}
+
 install_tailscale() {
     log "Installing Tailscale inside container $CTID (if not present)."
     pct exec "$CTID" -- bash -c '
@@ -453,6 +483,7 @@ case "$MODE" in
         ensure_ct_running
         enable_forwarding
         install_tailscale
+        enable_console_autologin
         tailscale_up
         post_notes
         ;;

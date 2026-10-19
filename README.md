@@ -86,6 +86,19 @@ Then, one-time in the admin console
 
 See [`ansible/README.md`](ansible/README.md) for the Ansible path.
 
+## Console access & SSH
+
+- **Proxmox console** opens a **root shell with no login prompt** — the install
+  flow configures autologin on the container's console tty, so the web-UI
+  Console button, `pct console <ctid>`, and `pct enter <ctid>` all drop
+  straight to root. This goes through the Proxmox host, not the network, so it
+  works regardless of Tailscale. Disable with `CONSOLE_AUTOLOGIN=0`.
+  (Anyone with Proxmox access can already `pct enter` as root, so autologin
+  does not widen that.)
+- **Tailscale SSH is OFF by default.** The container has no SSH entry path
+  unless you ask for one. To enable Tailscale SSH (network login over the
+  tailnet, governed by your ACLs), pass `TS_EXTRA_ARGS="--ssh"`.
+
 ## Modes (bash script)
 
 The script is re-runnable and takes a mode as its first argument (default
