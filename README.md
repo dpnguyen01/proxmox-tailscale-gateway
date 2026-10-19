@@ -29,39 +29,46 @@ SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" \
 ### Run directly from the Proxmox host shell (no manual copy)
 
 Paste this into the Proxmox **host** shell (as root). It downloads the latest
-script from this repo and runs `install`. Edit the variables on the first lines
-first. The repo is **private**, so the fetch needs a GitHub token with `repo`
-scope (create one at <https://github.com/settings/tokens>):
+script from this repo and runs `install`.
+
+With **no variables set**, `install` drops into an interactive **setup screen**
+that prompts for each setting (CTID, hostname, storage, network, subnet routes,
+exit-node toggle, auth key — hidden input), shows a summary, and asks you to
+confirm before building:
 
 ```bash
-# --- edit these ---
-export GITHUB_TOKEN="ghp_your_token_here"        # token with 'repo' scope (private repo)
-export SUBNET_ROUTES="192.168.1.0/24"             # your LAN(s), comma-separated
-export TS_AUTHKEY="tskey-XXXX"                    # https://login.tailscale.com/admin/settings/keys
-export CTID="150"                                 # unused container ID
-# optional: export IP_CONFIG="192.168.1.50/24"; export GATEWAY="192.168.1.1"
-# -------------------
-
 curl -fsSL \
-  -H "Authorization: token ${GITHUB_TOKEN}" \
-  -H "Accept: application/vnd.github.v3.raw" \
-  "https://api.github.com/repos/dpnguyen01/proxmox-tailscale-gateway/contents/deploy-tailscale-lxc.sh?ref=main" \
+  https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh \
   -o /root/deploy-tailscale-lxc.sh
 chmod +x /root/deploy-tailscale-lxc.sh
-/root/deploy-tailscale-lxc.sh install
+/root/deploy-tailscale-lxc.sh install        # interactive setup screen
 ```
 
-Later, to upgrade or re-point routes, re-fetch (or just reuse the saved copy):
+Prefer to pre-fill some or all answers? Set them as env vars first — any value
+you provide is **not** prompted for; only the rest are asked:
+
+```bash
+SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" CTID="150" \
+  /root/deploy-tailscale-lxc.sh install
+```
+
+For fully unattended runs (CI, or piped with no terminal), set
+`NONINTERACTIVE=1` (the script also auto-skips the screen when there is no TTY)
+and provide everything via env vars:
+
+```bash
+NONINTERACTIVE=1 SUBNET_ROUTES="192.168.1.0/24" TS_AUTHKEY="tskey-XXXX" CTID="150" \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh)" _ install
+```
+
+Later, to upgrade or re-point routes, reuse the saved copy (these modes are
+always non-interactive):
 
 ```bash
 APT_DIST_UPGRADE=1 /root/deploy-tailscale-lxc.sh upgrade
 SUBNET_ROUTES="10.0.0.0/24,192.168.1.0/24" /root/deploy-tailscale-lxc.sh reconfigure
 /root/deploy-tailscale-lxc.sh status
 ```
-
-> If you later make the repo **public**, the fetch simplifies to a plain
-> `curl -fsSL https://raw.githubusercontent.com/dpnguyen01/proxmox-tailscale-gateway/main/deploy-tailscale-lxc.sh -o /root/deploy-tailscale-lxc.sh`
-> with no token.
 
 Then, one-time in the admin console
 (<https://login.tailscale.com/admin/machines>): enable the subnet routes, tick
@@ -76,7 +83,7 @@ The script is re-runnable and takes a mode as its first argument (default
 
 | Mode | What it does |
 |------|--------------|
-| `install` | Create the container if absent, map TUN, install Tailscale, enable forwarding, bring it up. Idempotent. |
+| `install` | Create the container if absent, map TUN, install Tailscale, enable forwarding, bring it up. Idempotent. On a TTY with values unset, prompts via an interactive setup screen (skip with `NONINTERACTIVE=1`). |
 | `upgrade` | Upgrade the Tailscale package to latest, restart it, re-apply forwarding + current route/exit config. Add `APT_DIST_UPGRADE=1` to also `apt dist-upgrade` the OS. Does **not** recreate the container. |
 | `reconfigure` | Re-apply `tailscale up` with the current `SUBNET_ROUTES` / `ADVERTISE_EXIT_NODE` / `TS_EXTRA_ARGS`. Use after changing routes or toggling the exit node. No package changes. |
 | `status` | Print container + Tailscale status (read-only). |
