@@ -172,10 +172,10 @@ _prompt() {
     local current="${!var}" answer
     if [[ "$secret" == "1" ]]; then
         printf '%s [%s]: ' "$question" "${current:+(set)}" >/dev/tty
-        read -r -s answer </dev/tty; echo >/dev/tty
+        read -r -s answer </dev/tty || true; echo >/dev/tty
     else
         printf '%s [%s]: ' "$question" "$current" >/dev/tty
-        read -r answer </dev/tty
+        read -r answer </dev/tty || true
     fi
     [[ -n "$answer" ]] && printf -v "$var" '%s' "$answer"
 }
@@ -186,7 +186,7 @@ _prompt_yesno() {
     local def="no"; [[ "${!var}" == "1" ]] && def="yes"
     local answer
     printf '%s (yes/no) [%s]: ' "$question" "$def" >/dev/tty
-    read -r answer </dev/tty
+    read -r answer </dev/tty || true
     case "${answer,,}" in
         y|yes) printf -v "$var" '1' ;;
         n|no)  printf -v "$var" '0' ;;
@@ -220,7 +220,7 @@ interactive_setup() {
     if [[ -z "${_PROVIDED[CTID]:-}" ]]; then
         local _suggested_ctid; _suggested_ctid="$(next_free_ctid 2>/dev/null || true)"
         printf 'Container ID (CTID) -- blank = next free [%s]: ' "${_suggested_ctid:-auto}" >/dev/tty
-        local _ctid_ans; read -r _ctid_ans </dev/tty
+        local _ctid_ans; read -r _ctid_ans </dev/tty || true
         [[ -n "$_ctid_ans" ]] && CTID="$_ctid_ans"
     fi
 
@@ -245,12 +245,12 @@ interactive_setup() {
     if [[ -z "${_PROVIDED[IP_CONFIG]:-}" ]]; then
         local ipmode
         printf 'Network: dhcp or static? [%s]: ' "$( [[ "$IP_CONFIG" == dhcp ]] && echo dhcp || echo static )" >/dev/tty
-        read -r ipmode </dev/tty
+        read -r ipmode </dev/tty || true
         case "${ipmode,,}" in
             static)
                 printf 'Static IP with CIDR (e.g. 192.168.1.50/24): ' >/dev/tty
-                read -r IP_CONFIG </dev/tty
-                [[ -z "${_PROVIDED[GATEWAY]:-}" ]] && { printf 'Gateway (e.g. 192.168.1.1): ' >/dev/tty; read -r GATEWAY </dev/tty; }
+                read -r IP_CONFIG </dev/tty || true
+                [[ -z "${_PROVIDED[GATEWAY]:-}" ]] && { printf 'Gateway (e.g. 192.168.1.1): ' >/dev/tty; read -r GATEWAY </dev/tty || true; }
                 ;;
             dhcp|"") IP_CONFIG="dhcp" ;;
             *) warn "Unrecognized '$ipmode'; using dhcp."; IP_CONFIG="dhcp" ;;
@@ -277,7 +277,7 @@ interactive_setup() {
     echo "----------------------------------------------------------------------"
     local go
     printf 'Proceed with install? (yes/no) [yes]: ' >/dev/tty
-    read -r go </dev/tty
+    read -r go </dev/tty || true
     case "${go,,}" in
         n|no) die "Aborted by user." ;;
     esac
