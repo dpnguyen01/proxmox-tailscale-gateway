@@ -1,0 +1,70 @@
+---
+# group_vars/all.yml -- copy and edit for your environment.
+# Everything the playbook needs lives here.
+
+# ---------------------------------------------------------------------------
+# Proxmox API connection (used by the community.general.proxmox modules).
+# Create an API token in the PVE UI: Datacenter -> Permissions -> API Tokens.
+# Give it PVEAdmin (or a role with VM.Allocate) on the relevant path.
+# ---------------------------------------------------------------------------
+pve_node: "pve"                                   # the node name to create the CT on
+pve_api_host: "192.168.1.10"                       # Proxmox host / cluster API endpoint
+pve_api_user: "root@pam"
+pve_api_token_id: "ansible"                        # the token's ID
+pve_api_token_secret: "CHANGE-ME"                  # the token secret (vault this!)
+
+# ---------------------------------------------------------------------------
+# LXC template.
+# Leave template_name EMPTY to auto-pick the LATEST Debian standard template
+# available from pveam (recommended -- tracks the newest stable release).
+# The pre-task in the playbook resolves it. To pin a release, set it
+# explicitly, e.g. "debian-13-standard_13.0-1_amd64.tar.zst".
+# ---------------------------------------------------------------------------
+template_name: ""                                  # "" => latest Debian standard
+template_storage: "local"                          # storage holding CT templates
+
+# ---------------------------------------------------------------------------
+# Container identity / resources
+# ---------------------------------------------------------------------------
+ctid: 150
+ct_hostname: "tailscale-gw"
+ct_storage: "local-lvm"                            # rootfs storage
+ct_disk_gb: 4
+ct_cores: 1
+ct_memory_mb: 512
+ct_swap_mb: 512
+ct_bridge: "vmbr0"
+ct_unprivileged: true                              # safe; TUN is bind-mounted in
+
+# Network spec appended after the bridge. Either:
+#   "ip=dhcp"
+# or a static address (add a gateway):
+#   "ip=192.168.1.50/24,gw=192.168.1.1"
+ct_ip_spec: "ip=dhcp"
+
+# ---------------------------------------------------------------------------
+# How play 2 reaches the container.
+# For a static IP, set this to that address.
+# For DHCP, fill it in after the first run once you know the lease (or set a
+# DHCP reservation). If left empty, play 2 is skipped and you finish with:
+#   pct exec <ctid> -- tailscale up --authkey=... --advertise-routes=... --advertise-exit-node
+# (README has the full one-liner.)
+ct_ssh_host: ""
+ct_ssh_user: "root"
+
+# ---------------------------------------------------------------------------
+# Tailscale
+# ---------------------------------------------------------------------------
+# Auth key from https://login.tailscale.com/admin/settings/keys
+# Use a reusable, pre-authorized key for unattended re-deploys. VAULT THIS.
+ts_authkey: ""
+
+# Subnets this node advertises for subnet routing (comma-separated).
+# Set to the LAN(s) behind this box.
+subnet_routes: "192.168.1.0/24"
+
+# Advertise this node as an exit node.
+advertise_exit_node: true
+
+# Extra flags passed verbatim to `tailscale up`.
+ts_extra_args: "--ssh"

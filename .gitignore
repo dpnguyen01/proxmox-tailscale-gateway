@@ -1,0 +1,14 @@
+# Secrets — never commit real auth keys / API tokens / vault material
+*.vault
+vault.yml
+*.key
+.secrets
+secrets.yml
+
+# Local Ansible artifacts
+*.retry
+ansible/group_vars/*.local.yml
+
+# Editor / OS cruft
+.DS_Store
+*.swp

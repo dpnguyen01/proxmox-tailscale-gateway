@@ -1,0 +1,226 @@
+---
+# deploy-tailscale-lxc.yml
+#
+# Provision a Proxmox LXC and configure Tailscale inside it as an
+# EXIT NODE + SUBNET ROUTER.
+#
+# Two plays:
+#   1. Runs on the Proxmox host: creates the CT, injects the TUN device
+#      config, starts it.
+#   2. Runs inside the new container (added at runtime): installs Tailscale,
+#      enables IP forwarding, brings it up advertising routes + exit node.
+#
+# Requirements on the Ansible control node:
+#   ansible-galaxy collection install community.general
+#   pip install proxmoxer requests        # for the proxmox modules
+#
+# Run:
+#   ansible-playbook -i inventory.ini deploy-tailscale-lxc.yml
+#
+# All tunables live in group_vars/all.yml (copy from the template).
+
+- name: Create and configure the Tailscale LXC on the Proxmox host
+  hosts: proxmox
+  gather_facts: false
+  tasks:
+
+    # When template_name is empty, resolve the LATEST Debian standard template
+    # from pveam so this tracks the newest stable release automatically.
+    - name: Refresh the pveam template index
+      ansible.builtin.command: pveam update
+      changed_when: false
+      when: template_name | default('') | length == 0
+
+    - name: Find the latest available Debian standard template
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          pveam available --section system
+          | awk '{print $2}'
+          | grep -E '^debian-[0-9]+-standard'
+          | sort -V
+          | tail -n1
+        executable: /bin/bash
+      register: latest_debian
+      changed_when: false
+      when: template_name | default('') | length == 0
+
+    - name: Set template_name to the resolved latest Debian template
+      ansible.builtin.set_fact:
+        template_name: "{{ latest_debian.stdout | trim }}"
+      when: template_name | default('') | length == 0
+
+    - name: Fail if no Debian template could be resolved
+      ansible.builtin.assert:
+        that: template_name | default('') | length > 0
+        fail_msg: >-
+          Could not resolve a Debian template. List options on the host with:
+          pveam available --section system
+
+    - name: Report the template in use
+      ansible.builtin.debug:
+        msg: "Using LXC template: {{ template_name }}"
+
+    - name: Download the Debian LXC template
+      community.general.proxmox_template:
+        node: "{{ pve_node }}"
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        storage: "{{ template_storage }}"
+        template: "{{ template_name }}"
+      run_once: true
+
+    - name: Create the LXC container
+      community.general.proxmox:
+        vmid: "{{ ctid }}"
+        node: "{{ pve_node }}"
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        hostname: "{{ ct_hostname }}"
+        ostemplate: "{{ template_storage }}:vztmpl/{{ template_name }}"
+        storage: "{{ ct_storage }}"
+        disk: "{{ ct_disk_gb }}"
+        cores: "{{ ct_cores }}"
+        memory: "{{ ct_memory_mb }}"
+        swap: "{{ ct_swap_mb }}"
+        unprivileged: "{{ ct_unprivileged }}"
+        onboot: true
+        features: "nesting=1"
+        netif: '{"net0":"name=eth0,bridge={{ ct_bridge }},{{ ct_ip_spec }}"}'
+        state: present
+      register: ct_create
+
+    # The proxmox module cannot set raw lxc.* options, so patch the conf file
+    # directly on the host. /dev/net/tun is required by tailscaled.
+    - name: Ensure TUN device cgroup allow + bind mount in the CT config
+      ansible.builtin.lineinfile:
+        path: "/etc/pve/lxc/{{ ctid }}.conf"
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "lxc.cgroup2.devices.allow: c 10:200 rwm"
+        - "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file"
+      register: tun_conf
+
+    - name: Stop the container (to apply device config cleanly)
+      community.general.proxmox:
+        vmid: "{{ ctid }}"
+        node: "{{ pve_node }}"
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        state: stopped
+      when: tun_conf.changed
+
+    - name: Start the container
+      community.general.proxmox:
+        vmid: "{{ ctid }}"
+        node: "{{ pve_node }}"
+        api_host: "{{ pve_api_host }}"
+        api_user: "{{ pve_api_user }}"
+        api_token_id: "{{ pve_api_token_id }}"
+        api_token_secret: "{{ pve_api_token_secret }}"
+        state: started
+
+    - name: Wait for the container network (resolve the CT IP if DHCP)
+      ansible.builtin.pause:
+        seconds: 8
+
+    # Figure out how to reach the container for play 2. If you set a static IP
+    # in ct_ip_spec, ct_ssh_host is that IP. For DHCP, set ct_ssh_host yourself
+    # in group_vars once the lease is known, OR use pct exec (see README).
+    - name: Register the container as a runtime host for play 2
+      ansible.builtin.add_host:
+        name: "tailscale-ct"
+        ansible_host: "{{ ct_ssh_host }}"
+        ansible_user: "{{ ct_ssh_user | default('root') }}"
+        groups: tailscale_container
+      when: ct_ssh_host is defined and ct_ssh_host | length > 0
+
+- name: Configure Tailscale inside the container
+  hosts: tailscale_container
+  gather_facts: true
+  tasks:
+
+    - name: Enable IPv4 + IPv6 forwarding (persistent)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-tailscale.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.ipv6.conf.all.forwarding = 1
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload sysctl
+
+    - name: Flush handlers so forwarding is live before tailscale up
+      ansible.builtin.meta: flush_handlers
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+        update_cache: true
+        state: present
+
+    - name: Install Tailscale via the official script
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://tailscale.com/install.sh | sh
+        creates: /usr/bin/tailscale
+
+    - name: Enable and start tailscaled
+      ansible.builtin.systemd:
+        name: tailscaled
+        enabled: true
+        state: started
+
+    - name: Build the tailscale up argument list
+      ansible.builtin.set_fact:
+        ts_up_args: >-
+          --advertise-routes={{ subnet_routes }}
+          {{ '--advertise-exit-node' if advertise_exit_node | bool else '' }}
+          {{ ts_extra_args | default('') }}
+
+    - name: Bring Tailscale up (exit node + subnet router)
+      ansible.builtin.command:
+        cmd: >-
+          tailscale up --authkey={{ ts_authkey }} {{ ts_up_args }}
+      no_log: true          # keep the auth key out of logs
+      when: ts_authkey | default('') | length > 0
+      register: ts_up
+
+    - name: Manual-auth fallback when no auth key is provided
+      ansible.builtin.command:
+        cmd: "tailscale up {{ ts_up_args }}"
+      when: ts_authkey | default('') | length == 0
+      register: ts_up_manual
+      changed_when: true
+
+    - name: Show the login URL if manual auth is needed
+      ansible.builtin.debug:
+        msg: "{{ ts_up_manual.stderr_lines | default(['(check: tailscale status)']) }}"
+      when: ts_authkey | default('') | length == 0
+
+    - name: Report Tailscale status
+      ansible.builtin.command: tailscale status
+      register: ts_status
+      changed_when: false
+      failed_when: false
+
+    - name: Final status
+      ansible.builtin.debug:
+        msg: >-
+          {{ ts_status.stdout_lines }}
+          -- Next: approve subnet routes + exit node in the admin console
+          https://login.tailscale.com/admin/machines
+
+  handlers:
+    - name: reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: false
