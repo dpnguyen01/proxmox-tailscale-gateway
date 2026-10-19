@@ -408,22 +408,32 @@ sysctl -p /etc/sysctl.d/99-tailscale.conf >/dev/null
 enable_console_autologin() {
     [[ "$CONSOLE_AUTOLOGIN" == "1" ]] || { log "Console autologin disabled; skipping."; return; }
     log "Configuring root autologin on the container console tty."
-    # Debian LXC consoles run console-getty (/dev/console, used by the web-UI
-    # Console button and `pct console`) and getty@tty1. Override both gettys'
-    # ExecStart with --autologin root via a systemd drop-in, so the console
-    # opens a root shell with no login prompt.
+    # Debian LXC consoles run two gettys: console-getty (/dev/console, used by
+    # `pct console`) and getty@tty1 (the web-UI Console button attaches here).
+    # Each needs the agetty form that matches ITS device: tty1 is a virtual
+    # console (positional tty + term, no baud list), console is the serial-ish
+    # /dev/console. The earlier one-size form (`--keep-baud - <bauds> $TERM`)
+    # is a serial-line invocation and leaves a login: prompt on tty1.
     pct exec "$CTID" -- bash -c '
 set -e
-for unit in console-getty.service "getty@tty1.service"; do
-    dir="/etc/systemd/system/${unit}.d"
-    mkdir -p "$dir"
-    cat >"$dir/autologin.conf" <<EOF
+# getty@tty1 -> virtual console form: positional tty name + term type.
+d1=/etc/systemd/system/getty@tty1.service.d
+mkdir -p "$d1"
+cat >"$d1/autologin.conf" <<EOF
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud - 115200,38400,9600 \$TERM
+ExecStart=-/sbin/agetty --autologin root --noclear tty1 linux
 EOF
-done
+# console-getty -> /dev/console form.
+d2=/etc/systemd/system/console-getty.service.d
+mkdir -p "$d2"
+cat >"$d2/autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud console 115200,38400,9600 vt220
+EOF
 systemctl daemon-reload
+systemctl restart getty@tty1.service 2>/dev/null || true
 systemctl restart console-getty.service 2>/dev/null || true
 '
 }
